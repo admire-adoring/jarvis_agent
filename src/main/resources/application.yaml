@@ -2,6 +2,18 @@ spring:
   application:
     name: jarvis_agent
 
+  ai:
+    # 启用的 chat 模型（填 none 可禁用）
+    model:
+      chat: openai
+    openai:
+      # 阿里云百炼 OpenAI 兼容端点；换 OpenAI 官方则删掉 base-url 即可
+      api-key: ${AI_DASHSCOPE_API_KEY:}
+      base-url: https://dashscope.aliyuncs.com/compatible-mode/v1
+      chat:
+        model: qwen-plus
+        temperature: 0.7
+
 server:
   port: 9123
   servlet:
