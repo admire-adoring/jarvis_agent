@@ -27,9 +27,10 @@
         <url/>
     </scm>
     <properties>
-        <!-- 本机最高 JDK 为 23（brew openjdk@23），Spring AI 2.0 要求 Java 21+，故定 21；
-             如需 Java 25，安装 JDK 25 后改回 25 即可 -->
-        <java.version>21</java.version>
+        <!-- 本机已安装的最高 JDK 为 17（jdk-17 / temurin-17）；
+             Spring Boot 4.1.1 与 Spring AI 2.0.1 的字节码均为 class version 61（Java 17），
+             故定 17 即可编译运行。若装上 JDK 21+，把这里改成对应版本即可。 -->
+        <java.version>17</java.version>
         <spring-ai.version>2.0.1</spring-ai.version>
     </properties>
     <!-- Maven Central is included by default in Maven builds.
@@ -56,6 +57,13 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-webmvc-test</artifactId>
             <scope>test</scope>
+        </dependency>
+
+        <!-- JSON：Boot 4 的 webmvc starter 不再默认带 Jackson，
+             这里显式引入，供 @RequestBody 反序列化与 SSE 帧序列化使用 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jackson</artifactId>
         </dependency>
 
         <!-- Spring AI: 模型接入（OpenAI SDK，兼容 DeepSeek / 通义百炼 / vLLM 等 OpenAI 协议端点） -->
