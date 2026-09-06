@@ -43,6 +43,13 @@
         </repository>
     </repositories>
     <dependencies>
+        <!-- Spring MVC（Servlet / Tomcat 传统阻塞式栈）：Boot 4 起 servlet 栈 starter
+             由 starter-web 改名为 starter-webmvc。技术取向：用户管理 / 知识库 / 宠物等
+             传统业务一律阻塞式三层（Controller-Service-Repository），AI 对话的 SSE 流式
+             端点是唯一"长连接"点，用 SseEmitter（Servlet 3.1 异步，推送不占请求线程）
+             手工编码标准 id / event / retry / data 帧，实现见 ChatController。
+             整体不引入 WebFlux：传统 JDBC 生态（MyBatis / JPA）在响应式栈下只能 block()，
+             收益远小于迁移成本；SSE 单端点无需为此切换全栈。 -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-webmvc</artifactId>

@@ -99,7 +99,7 @@
   - Java 25
   - Spring Boot 4.x
   - Spring AI（LLM集成框架）
-  - Spring WebFlux（响应式编程）
+  - Spring MVC（Servlet 阻塞式；SSE 流式走 SseEmitter）
   - Spring Security + JWT（认证授权）
 
 AI技术：

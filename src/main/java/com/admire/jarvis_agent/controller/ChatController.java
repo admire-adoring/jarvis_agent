@@ -1,20 +1,25 @@
 package com.admire.jarvis_agent.controller;
 
 import com.admire.jarvis_agent.dto.ChatRequest;
+import com.admire.jarvis_agent.dto.ResponseVO;
 import com.admire.jarvis_agent.service.ChatService;
 import jakarta.annotation.Resource;
-import tools.jackson.core.JacksonException;
-import tools.jackson.databind.ObjectMapper;
-import tools.jackson.databind.json.JsonMapper;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.CacheControl;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 
+import java.io.IOException;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * @Description 对话
@@ -26,11 +31,10 @@ import java.util.Map;
 @RequestMapping("/chat")
 public class ChatController {
 
-    /**
-     * Spring Boot 4.x 内置的是 Jackson 3（包名为 tools.jackson，与 Spring AI 依赖的 Jackson 2 并存），
-     * 这里自建实例而不注入容器 bean，避免受自动配置开关影响。
-     */
-    private static final ObjectMapper MAPPER = JsonMapper.builder().build();
+    /** 服务端建议的重连间隔（毫秒），编码为每帧 retry：客户端断线按此等待后重连 */
+    private static final long RETRY_MILLIS = 3000L;
+
+    private static final String ERROR_MESSAGE = "对话出错了，请稍后再试";
 
     @Resource
     private ChatService chatService;
@@ -39,50 +43,104 @@ public class ChatController {
      * 单轮对话（阻塞，调试用；正式链路走 /chat/sse）
      */
     @PostMapping
-    public String chat(@RequestBody ChatRequest request) {
-        return chatService.chat(request.agentOrDefault(), request.conversationIdOrDefault(), request.message());
+    public ResponseVO<String> chat(@RequestBody ChatRequest request) {
+        try {
+            String answer = chatService.chat(request.agentOrDefault(), request.conversationIdOrDefault(), request.message());
+            return ResponseVO.ok(answer);
+        } catch (Exception e) {
+            log.error("chat error, message={}", request.message(), e);
+            return ResponseVO.error(500, ERROR_MESSAGE);
+        }
     }
 
     /**
-     * SSE 流式对话。
+     * SSE 流式对话（标准 SSE 协议，WebMVC + {@link SseEmitter}）。
      *
-     * <p>事件协议（data 均为单行 JSON，前端按「累计快照」渲染）：
+     * <p>每帧含标准字段（W3C EventSource），帧间以空行分隔：
      * <pre>
-     * event: start   data: {"agent":"pet","conversationId":"pet-xxx"}   // 立即下发，用于冲刷响应头
-     * event: delta   data: {"delta":"增量文本"}                          // 0..N 条
-     * event: done    data: {"agent":"pet"}                              // 正常结束
-     * event: error   data: {"message":"错误信息"}                        // 序列化等极端情况
+     * id:1
+     * event:start
+     * retry:3000
+     * data:{"agent":"jarvis","conversationId":"jarvis-xxx"}
+     *
+     * id:2
+     * event:delta
+     * data:{"delta":"你好"}
      * </pre>
+     * 正常结束发 {@code done} 帧后关闭；出错发 {@code error} 帧即终止（终态，不再发 done）。
+     *
+     * <p>字段语义：
+     * <ul>
+     *   <li>{@code id}：单调自增游标。客户端维护 Last-Event-ID，断线重连时随请求头带回，供断点续推；</li>
+     *   <li>{@code event}：事件分类 start / delta / done / error，客户端按事件名分派；</li>
+     *   <li>{@code retry}：服务端建议的重连等待毫秒数；</li>
+     *   <li>{@code data}：单行 JSON（换行经序列化转义，不破坏帧边界）。</li>
+     * </ul>
+     *
+     * <p>实现注：WebMVC 下 SseEmitter 是标准 SSE 的正统载体（基于 Servlet 3.1 异步，
+     * 推送不占请求线程）。不可直接返回 {@code Flux<ServerSentEvent>}——那是 WebFlux 的
+     * 编码器类型，MVC 栈不识别，元素只会被包成裸 {@code data:}，带不出 id / event / retry。
+     *
+     * <p>响应头：{@code text/event-stream}（SSE 必须）、{@code Cache-Control: no-cache}、
+     * {@code X-Accel-Buffering: no}（关闭 Nginx 等代理缓冲，保证逐帧即时到达）。
      */
     @PostMapping(value = "/sse", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public Flux<String> sseChat(@RequestBody ChatRequest request) {
+    public ResponseEntity<SseEmitter> sseChat(@RequestBody ChatRequest request) {
         String agent = request.agentOrDefault();
         String conversationId = request.conversationIdOrDefault();
         log.info("sseChat start, agent={}, conversationId={}", agent, conversationId);
 
-        Flux<String> start = Flux.just(frame("start", Map.of("agent", agent, "conversationId", conversationId)));
-        Flux<String> deltas = chatService.chatStream(agent, conversationId, request.message())
-                .map(chunk -> frame("delta", Map.of("delta", chunk)))
-                .onErrorResume(e -> {
-                    log.error("sseChat stream error, agent={}, conversationId={}", agent, conversationId, e);
-                    return Flux.just(frame("error", Map.of("message", "对话出错了，请稍后再试")));
-                });
-        Flux<String> done = Flux.just(frame("done", Map.of("agent", agent)));
+        SseEmitter emitter = new SseEmitter(0L);
+        AtomicInteger seq = new AtomicInteger();
 
-        return Flux.concat(start, deltas, done)
-                .doOnCancel(() -> log.info("sseChat client disconnected, agent={}, conversationId={}", agent, conversationId))
-                .doOnError(e -> log.error("sseChat error, agent={}, conversationId={}", agent, conversationId, e));
+        Flux<SseEmitter.SseEventBuilder> frames = Flux.concat(
+                        // defer：让 frame() 的 id 分配发生在订阅/消费时而非 Flux 组装时，
+                        // 否则 done 帧会在构造期抢先拿到小 id，造成游标乱序（实测见 done id < delta id）
+                        Flux.defer(() -> Flux.just(frame(seq, "start", Map.of("agent", agent, "conversationId", conversationId)))),
+                        chatService.chatStream(agent, conversationId, request.message())
+                                .map(text -> frame(seq, "delta", Map.of("delta", text == null ? "" : text))),
+                        Flux.defer(() -> Flux.just(frame(seq, "done", Map.of("agent", agent))))
+                )
+                // 流内错误统一收敛为 error 帧收尾（error 为终态，其后不再发 done）
+                .onErrorResume(e -> {
+                    log.error("sseChat terminal error, agent={}, conversationId={}", agent, conversationId, e);
+                    return Flux.just(frame(seq, "error", Map.of("message", ERROR_MESSAGE)));
+                });
+
+        Disposable subscription = frames.subscribe(
+                event -> safeSend(emitter, event),
+                // 正常不可达：流内错误已被上方 onErrorResume 收敛为 error 帧
+                error -> emitter.completeWithError(error),
+                emitter::complete
+        );
+
+        emitter.onCompletion(subscription::dispose);
+        emitter.onError(error -> {
+            log.error("sseChat emitter error, agent={}, conversationId={}", agent, conversationId, error);
+            subscription.dispose();
+        });
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.TEXT_EVENT_STREAM);
+        headers.setCacheControl(CacheControl.noCache());
+        headers.add("X-Accel-Buffering", "no");
+        return ResponseEntity.ok().headers(headers).body(emitter);
     }
 
-    /**
-     * 组装一帧 SSE：data 统一走 JSON，避免正文里的换行 / 引号破坏以空行分帧的协议
-     */
-    private String frame(String event, Object data) {
+    /** 构建标准 SSE 帧：id（自增游标）+ event（事件名）+ retry（重连间隔）+ data（业务载荷） */
+    private static SseEmitter.SseEventBuilder frame(AtomicInteger seq, String event, Object data) {
+        return SseEmitter.event()
+                .id(String.valueOf(seq.incrementAndGet()))
+                .name(event)
+                .reconnectTime(RETRY_MILLIS)
+                .data(data);
+    }
+
+    private void safeSend(SseEmitter emitter, SseEmitter.SseEventBuilder event) {
         try {
-            return "event: " + event + "\ndata: " + MAPPER.writeValueAsString(data) + "\n\n";
-        } catch (JacksonException e) {
-            log.error("sse frame serialize error, event={}", event, e);
-            return "event: error\ndata: {\"message\":\"服务端序列化失败\"}\n\n";
+            emitter.send(event);
+        } catch (IOException | IllegalStateException e) {
+            emitter.completeWithError(e);
         }
     }
 }

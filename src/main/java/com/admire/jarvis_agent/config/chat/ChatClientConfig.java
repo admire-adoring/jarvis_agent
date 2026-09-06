@@ -26,7 +26,7 @@ public class ChatClientConfig {
     @Bean
     public ChatClient jarvisChatClient(ChatClient.Builder builder, ChatMemory chatMemory) {
         return builder
-                .defaultSystem("你是 Jarvis，一个简洁、直接的助手。回答用中文，不啰嗦。")
+                .defaultSystem(AgentPrompts.of("JARVIS"))
                 .defaultAdvisors(MessageChatMemoryAdvisor.builder(chatMemory).build())
                 .build();
     }

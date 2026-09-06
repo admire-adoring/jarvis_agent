@@ -20,8 +20,6 @@ public class ChatServiceImpl implements ChatService {
 
     private static final String EMPTY_MESSAGE = "请输入内容";
 
-    private static final String ERROR_MESSAGE = "对话出错了，请稍后再试";
-
     @Resource
     private ChatClient chatClient;
 
@@ -59,8 +57,8 @@ public class ChatServiceImpl implements ChatService {
                 .content()
                 .doOnNext(chunk -> log.debug("chatStream chunk, conversationId={}, chunk={}", conversationId, chunk))
                 .doOnComplete(() -> log.info("chatStream complete, agent={}, conversationId={}", agent, conversationId))
-                .doOnError(e -> log.error("chatStream error, agent={}, conversationId={}", agent, conversationId, e))
-                // 出错也回落成一条可读文本，由 Controller 继续以 delta 事件推给前端，连接不会挂死
-                .onErrorResume(e -> Flux.just(ERROR_MESSAGE));
+                .doOnError(e -> log.error("chatStream error, agent={}, conversationId={}", agent, conversationId, e));
+        // 错误不在此吞成文本：让异常冒泡到 Controller，统一转 event=error 终态帧，
+        // 前端才能区分「模型正常回复」与「系统出错」（否则 error 事件永远不会出现）
     }
 }
