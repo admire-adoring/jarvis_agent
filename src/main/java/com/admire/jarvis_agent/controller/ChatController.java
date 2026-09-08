@@ -1,10 +1,13 @@
 package com.admire.jarvis_agent.controller;
 
+import com.admire.jarvis_agent.dto.ChatEventType;
 import com.admire.jarvis_agent.dto.ChatRequest;
+import com.admire.jarvis_agent.dto.ChatSseEnvelope;
 import com.admire.jarvis_agent.dto.ResponseVO;
 import com.admire.jarvis_agent.service.ChatService;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -39,6 +42,10 @@ public class ChatController {
     @Resource
     private ChatService chatService;
 
+    /** 当前对话模型名，仅用于 start 帧回传给客户端（配置缺失不影响主流程） */
+    @Value("${spring.ai.openai.chat.model:unknown}")
+    private String chatModel;
+
     /**
      * 单轮对话（阻塞，调试用；正式链路走 /chat/sse）
      */
@@ -61,13 +68,23 @@ public class ChatController {
      * id:1
      * event:start
      * retry:3000
-     * data:{"agent":"jarvis","conversationId":"jarvis-xxx"}
+     * data:{"v":1,"type":"start","agent":"jarvis","scenario":"jarvis",
+     *       "conversationId":"jarvis-xxx","seq":1,"ts":1757130000000,
+     *       "payload":{"model":"deepseek-v4-flash-0731"}}
      *
      * id:2
      * event:delta
-     * data:{"delta":"你好"}
+     * retry:3000
+     * data:{"v":1,"type":"delta","agent":"jarvis","scenario":"jarvis",
+     *       "conversationId":"jarvis-xxx","seq":2,"ts":1757130000100,
+     *       "payload":{"role":"assistant","content":"你好"}}
      * </pre>
      * 正常结束发 {@code done} 帧后关闭；出错发 {@code error} 帧即终止（终态，不再发 done）。
+     *
+     * <p>{@code data} 为统一信封 {@link ChatSseEnvelope}：{@code type / agent / scenario /
+     * conversationId / seq / ts} 每帧都带，业务内容放 {@code payload}，
+     * 结构由 {@link ChatEventType} 决定。这样单帧即可自解释，Apifox 调试、日志排查、
+     * 多 Agent 并行流归并都不依赖请求上下文。
      *
      * <p>字段语义：
      * <ul>
@@ -96,15 +113,19 @@ public class ChatController {
         Flux<SseEmitter.SseEventBuilder> frames = Flux.concat(
                         // defer：让 frame() 的 id 分配发生在订阅/消费时而非 Flux 组装时，
                         // 否则 done 帧会在构造期抢先拿到小 id，造成游标乱序（实测见 done id < delta id）
-                        Flux.defer(() -> Flux.just(frame(seq, "start", Map.of("agent", agent, "conversationId", conversationId)))),
+                        Flux.defer(() -> Flux.just(frame(seq, agent, conversationId, ChatEventType.START,
+                                Map.of("model", chatModel)))),
                         chatService.chatStream(agent, conversationId, request.message())
-                                .map(text -> frame(seq, "delta", Map.of("delta", text == null ? "" : text))),
-                        Flux.defer(() -> Flux.just(frame(seq, "done", Map.of("agent", agent))))
+                                .map(text -> frame(seq, agent, conversationId, ChatEventType.DELTA,
+                                        Map.of("role", "assistant", "content", text == null ? "" : text))),
+                        Flux.defer(() -> Flux.just(frame(seq, agent, conversationId, ChatEventType.DONE,
+                                Map.of("finishReason", "stop"))))
                 )
                 // 流内错误统一收敛为 error 帧收尾（error 为终态，其后不再发 done）
                 .onErrorResume(e -> {
                     log.error("sseChat terminal error, agent={}, conversationId={}", agent, conversationId, e);
-                    return Flux.just(frame(seq, "error", Map.of("message", ERROR_MESSAGE)));
+                    return Flux.just(frame(seq, agent, conversationId, ChatEventType.ERROR,
+                            Map.of("code", "UPSTREAM_ERROR", "message", ERROR_MESSAGE)));
                 });
 
         Disposable subscription = frames.subscribe(
@@ -127,13 +148,21 @@ public class ChatController {
         return ResponseEntity.ok().headers(headers).body(emitter);
     }
 
-    /** 构建标准 SSE 帧：id（自增游标）+ event（事件名）+ retry（重连间隔）+ data（业务载荷） */
-    private static SseEmitter.SseEventBuilder frame(AtomicInteger seq, String event, Object data) {
+    /**
+     * 构建标准 SSE 帧：id（自增游标，与信封 seq 同值）+ event（事件名）+ retry（重连间隔）+ data（统一信封）。
+     *
+     * <p>Controller 在此完成「业务载荷 → 协议帧」的映射；Service 层只负责产出领域内容，
+     * 未来 Orchestrator 接入后 Service 改返回领域事件，本方法不动。
+     */
+    private static SseEmitter.SseEventBuilder frame(AtomicInteger seq, String agent, String conversationId,
+                                                    ChatEventType type, Object payload) {
+        int id = seq.incrementAndGet();
+        ChatSseEnvelope envelope = ChatSseEnvelope.of(type, agent, conversationId, id, payload);
         return SseEmitter.event()
-                .id(String.valueOf(seq.incrementAndGet()))
-                .name(event)
+                .id(String.valueOf(id))
+                .name(type.getValue())
                 .reconnectTime(RETRY_MILLIS)
-                .data(data);
+                .data(envelope);
     }
 
     private void safeSend(SseEmitter emitter, SseEmitter.SseEventBuilder event) {
